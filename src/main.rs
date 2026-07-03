@@ -8,11 +8,11 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgPool, prelude::FromRow};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 struct Task {
     id: Uuid,
     title: String,
@@ -90,11 +90,82 @@ impl IntoResponse for ApiError {
     }
 }
 
+AI Mode Conversation: error[E0599]: no method named `as_database_error` found for struct `Box<(dyn DatabaseError + 'static)>` in the current scopeYou said: error[E0599]: no method named `as_database_error` found for struct `Box<(dyn DatabaseError + 'static)>` in the current scopeerror[E0599]: no method named `as_database_error` found for struct `Box<(dyn DatabaseError + 'static)>` in the current scopeThe method as_database_error belongs to the sqlx::Error enum, not the Box<dyn DatabaseError> type. If you have unwrapped or pattern-matched your result to extract a Box<(dyn DatabaseError + 'static)> directly, you can no longer call that method.How to FixYou should call .as_database_error() or .into_database_error() before you access the inner boxed error, directly on the sqlx::Error enum.1. Call it directly on the sqlx::Error enum:rustif let Err(e) = query.await {
+    if let Some(db_err) = e.as_database_error() {
+        // e.g., print the error code
+        println!("Database error code: {:?}", db_err.code()); 
+    }
+}
+Use code with caution.2. Pattern matching the sqlx::Error:If you are already matching the error, you can catch the Database variant and call .as_database_error() (or .into_database_error()) on the Box<dyn DatabaseError> right there:rustmatch query.await {
+    Ok(_) => { /* ... */ }
+    Err(sqlx::Error::Database(db_err)) => {
+        // db_err is Box<dyn DatabaseError>
+        println!("Error: {}", db_err.message());
+    }
+    Err(e) => { /* handle other SQLx errors */ }
+}
+Use code with caution.Check out the official documentation for sqlx::Error to see the full list of helper methods available for SQL errors.Could you share the code snippet where you are handling the error and trying to call as_database_error? I can refactor it exactly to match your use case.4 sitesError in sqlx - Rust - Docs.rsRepresents all the ways a method can fail within SQLx. Variants (Non-exhaustive) This enum is marked as non-exhaustive. Non-exhaus...Docs.rs"std::vec" Search - Rustpub fn into_database_error(self) -> Option>. Source. pub fn as_database_error(&self) -> Option<&(dyn DatabaseError + 'static)>. Tr...www.sea-ql.org"u32 -> bool" Search - Rust - NTNURepresents all the ways a method can fail within SQLx ... as_database_error; into_database_error. Trait ... (Box), Io(Error), Tls(pages.pvv.ntnu.noShow allYou said: impl From<sqlx::Error> for ApiError {
+    fn from(err: sqlx::Error) -> Self {
+        eprintln!("SQLx Error: {err:?}");
+        match err {
+            sqlx::Error::RowNotFound => ApiError::TaskNotFound(Uuid::nil()),
+            sqlx::Error::Database(db_err) => {
+                if let Some(pg_err) = db_err.as_database_error() {
+                    if pg_err.code().map_or(false, |c| c == "23505") {
+                        return ApiError::InvalidInput(format!(
+                            "Duplicate entry: {}",
+                            pg_err
+                                .detail()
+                                .unwrap_or("A record with that unique value already exists.")
+                        ));
+                    }
+                }
+                ApiError::DbError(err.to_string())
+            }
+            _ => ApiError::DbError(err.to_string()),
+        }
+    }
+}The issue is that inside sqlx::Error::Database(db_err), the db_err variable is already the unwrapped Box<dyn DatabaseError>. The as_database_error() method belongs to the outer sqlx::Error enum, which is why it cannot be found on db_err.Because db_err already implements the DatabaseError trait, you can access methods like .code() and .detail() directly on it without calling as_database_error().Additionally, since you destructured err in the match arm, you cannot use err.to_string() inside that arm. You should use db_err.to_string() instead.Fixed Implementationrustimpl From<sqlx::Error> for ApiError {
+    fn from(err: sqlx::Error) -> Self {
+        eprintln!("SQLx Error: {err:?}");
+        match err {
+            sqlx::Error::RowNotFound => ApiError::TaskNotFound(Uuid::nil()),
+            sqlx::Error::Database(db_err) => {
+                // db_err is already the database error box!
+                if db_err.code().map_or(false, |c| c == "23505") {
+                    return ApiError::InvalidInput(format!(
+                        "Duplicate entry: {}",
+                        db_err
+                            .detail()
+                            .unwrap_or("A record with that unique value already exists.")
+                    ));
+                }
+                ApiError::DbError(db_err.to_string())
+            }
+            _ => ApiError::DbError(err.to_string()),
+        }
+    }
+}
 impl From<sqlx::Error> for ApiError {
     fn from(err: sqlx::Error) -> Self {
         eprintln!("SQLx Error: {err:?}");
         match err {
             sqlx::Error::RowNotFound => ApiError::TaskNotFound(Uuid::nil()),
+            sqlx::Error::Database(db_err) => {
+                // Downcast to Postgres-specific error to access .detail()
+                if let Some(pg_err) = db_err.downcast_ref::<sqlx::postgres::PgDatabaseError>() {
+                    if pg_err.code() == "23505" {
+                        return ApiError::InvalidInput(format!(
+                            "Duplicate entry: {}",
+                            pg_err
+                                .detail()
+                                .unwrap_or("A record with that unique value already exists.")
+                        ));
+                    }
+                }
+                
+                ApiError::DbError(db_err.to_string())
+            }
             _ => ApiError::DbError(err.to_string()),
         }
     }
@@ -152,6 +223,14 @@ async fn create_app() -> Router {
     let pool = PgPool::connect(&database_url)
         .await
         .expect("Failed to connect to PostgreSQL database!");
+
+    println!("Running database migrations...");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("Failed to run database migrations!");
+    println!("Database migrations completed successfully.");
+
     let app_state = Arc::new(AppState { db_pool: pool });
 
     Router::new()
