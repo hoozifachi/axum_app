@@ -18,6 +18,8 @@ sqlx = { version = "0.7", features = [
 ] }
 dotenvy = "0.15"
 chrono = { version = "0.4", features = ["serde"] }
+argon2 = "0.5"
+base64 = "0.21"
 
 [dev-dependencies]
 http-body-util = "0.1.3"

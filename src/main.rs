@@ -40,12 +40,36 @@ struct UpdateTaskPayload {
     completed: Option<bool>,
 }
 
+#[derive(Debug, Serialize, Deserialize, FromRow)]
+struct User {
+    id: Uuid,
+    email: String,
+    password_hash: String,
+    password_salt: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterUserPayload {
+    email: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginUserPayload {
+    email: String,
+    password: String,
+}
+
 struct AppState {
     db_pool: PgPool,
 }
 
 #[derive(Debug, Serialize)]
 enum ApiError {
+    UserAlreadyExists(String),
+    InvalidCredentials,
     TaskNotFound(Uuid),          // 404
     InvalidInput(String),        // 400
     DuplicateEntry(String),      // 409
@@ -55,23 +79,38 @@ enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let (status, error_message) = match self {
+        let (status, error_message, error_type) = match self {
+            ApiError::UserAlreadyExists(email) => (
+                StatusCode::CONFLICT,
+                format!("User with email '{email}' already exists."),
+                "UserAlreadyExists",
+            ),
+            ApiError::InvalidCredentials => (
+                StatusCode::UNAUTHORIZED,
+                "Invalid email or password".to_string(),
+                "InvalidCredentials",
+            ),
             ApiError::TaskNotFound(id) => (
                 StatusCode::NOT_FOUND,
                 format!("Task with ID {id} not found."),
+                "TaskNotFound",
             ),
-            ApiError::InvalidInput(msg) => {
-                (StatusCode::BAD_REQUEST, format!("Invalid input: {msg}."))
-            }
+            ApiError::InvalidInput(msg) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid input: {msg}."),
+                "InvalidInput",
+            ),
             ApiError::DuplicateEntry(id) => (
                 StatusCode::CONFLICT,
                 format!("Task with ID {id} already exists"),
+                "DuplicateEntry",
             ),
             ApiError::InternalServerError(msg) => {
                 eprintln!("Internal server error: {msg}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "An unexpected internal server error occured".to_string(),
+                    "InternalServerError",
                 )
             }
             ApiError::DbError(msg) => {
@@ -79,18 +118,14 @@ impl IntoResponse for ApiError {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "An unexpected internal server error occured.".to_string(),
+                    "DatabaseError",
                 )
             }
         };
         let body = Json(serde_json::json!({
             "error_code": status.as_u16(),
             "message": error_message,
-            "error_type": match status {
-                StatusCode::NOT_FOUND => "NotFound",
-                StatusCode::BAD_REQUEST => "InvalidInput",
-                StatusCode::CONFLICT => "Conflict",
-                _ => "ServerError"
-            }
+            "error_type": error_type
         }));
 
         (status, body).into_response()
@@ -101,21 +136,30 @@ impl From<sqlx::Error> for ApiError {
     fn from(err: sqlx::Error) -> Self {
         eprintln!("SQLx Error: {err:?}");
         match err {
-            sqlx::Error::RowNotFound => ApiError::TaskNotFound(Uuid::nil()),
+            sqlx::Error::RowNotFound => ApiError::InvalidCredentials,
             sqlx::Error::Database(db_err) => {
                 // Downcast to Postgres-specific error to access .detail()
-                if let Some(pg_err) = db_err.try_downcast_ref::<PgDatabaseError>()
-                    && pg_err.code() == "23505"
-                {
-                    return ApiError::InvalidInput(format!(
-                        "Duplicate entry: {}",
-                        pg_err
-                            .detail()
-                            .unwrap_or("A record with that unique value already exists.")
-                    ));
+                if let Some(pg_err) = db_err.try_downcast_ref::<PgDatabaseError>() {
+                    match pg_err.code() {
+                        "23505" => {
+                            let detail = pg_err
+                                .detail()
+                                .unwrap_or("A record with that unique value already exists.");
+                            if detail.contains("email") {
+                                ApiError::UserAlreadyExists("".to_string())
+                            } else {
+                                ApiError::DbError(format!("Unique constraint violated: {detail}"))
+                            }
+                        }
+                        "23502" => ApiError::InvalidInput(format!(
+                            "A required field is missing. Detail: {}",
+                            pg_err.detail().unwrap_or("No specific details available.")
+                        )),
+                        _ => ApiError::DbError(format!("Uncategorized database error: {pg_err}")),
+                    }
+                } else {
+                    ApiError::DbError(db_err.to_string())
                 }
-
-                ApiError::DbError(db_err.to_string())
             }
             _ => ApiError::DbError(err.to_string()),
         }
