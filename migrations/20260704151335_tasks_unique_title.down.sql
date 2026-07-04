@@ -1,0 +1,1 @@
+ALTER TABLE tasks DROP CONSTRAINT unique_title;

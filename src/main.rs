@@ -46,10 +46,10 @@ struct AppState {
 
 #[derive(Debug, Serialize)]
 enum ApiError {
-    TaskNotFound(Uuid),
-    InvalidInput(String),
-    TaskAlreadyExists(Uuid),
-    InternalServerError(String),
+    TaskNotFound(Uuid),          // 404
+    InvalidInput(String),        // 400
+    DuplicateEntry(String),      // 409
+    InternalServerError(String), // 500
     DbError(String),
 }
 
@@ -63,7 +63,7 @@ impl IntoResponse for ApiError {
             ApiError::InvalidInput(msg) => {
                 (StatusCode::BAD_REQUEST, format!("Invalid input: {msg}."))
             }
-            ApiError::TaskAlreadyExists(id) => (
+            ApiError::DuplicateEntry(id) => (
                 StatusCode::CONFLICT,
                 format!("Task with ID {id} already exists"),
             ),
