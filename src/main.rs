@@ -8,7 +8,12 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, prelude::FromRow};
+use sqlx::{
+    PgPool,
+    postgres::PgDatabaseError,
+    prelude::FromRow,
+    types::chrono::{DateTime, Utc},
+};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -18,6 +23,8 @@ struct Task {
     title: String,
     description: Option<String>,
     completed: bool,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -90,62 +97,6 @@ impl IntoResponse for ApiError {
     }
 }
 
-AI Mode Conversation: error[E0599]: no method named `as_database_error` found for struct `Box<(dyn DatabaseError + 'static)>` in the current scopeYou said: error[E0599]: no method named `as_database_error` found for struct `Box<(dyn DatabaseError + 'static)>` in the current scopeerror[E0599]: no method named `as_database_error` found for struct `Box<(dyn DatabaseError + 'static)>` in the current scopeThe method as_database_error belongs to the sqlx::Error enum, not the Box<dyn DatabaseError> type. If you have unwrapped or pattern-matched your result to extract a Box<(dyn DatabaseError + 'static)> directly, you can no longer call that method.How to FixYou should call .as_database_error() or .into_database_error() before you access the inner boxed error, directly on the sqlx::Error enum.1. Call it directly on the sqlx::Error enum:rustif let Err(e) = query.await {
-    if let Some(db_err) = e.as_database_error() {
-        // e.g., print the error code
-        println!("Database error code: {:?}", db_err.code()); 
-    }
-}
-Use code with caution.2. Pattern matching the sqlx::Error:If you are already matching the error, you can catch the Database variant and call .as_database_error() (or .into_database_error()) on the Box<dyn DatabaseError> right there:rustmatch query.await {
-    Ok(_) => { /* ... */ }
-    Err(sqlx::Error::Database(db_err)) => {
-        // db_err is Box<dyn DatabaseError>
-        println!("Error: {}", db_err.message());
-    }
-    Err(e) => { /* handle other SQLx errors */ }
-}
-Use code with caution.Check out the official documentation for sqlx::Error to see the full list of helper methods available for SQL errors.Could you share the code snippet where you are handling the error and trying to call as_database_error? I can refactor it exactly to match your use case.4 sitesError in sqlx - Rust - Docs.rsRepresents all the ways a method can fail within SQLx. Variants (Non-exhaustive) This enum is marked as non-exhaustive. Non-exhaus...Docs.rs"std::vec" Search - Rustpub fn into_database_error(self) -> Option>. Source. pub fn as_database_error(&self) -> Option<&(dyn DatabaseError + 'static)>. Tr...www.sea-ql.org"u32 -> bool" Search - Rust - NTNURepresents all the ways a method can fail within SQLx ... as_database_error; into_database_error. Trait ... (Box), Io(Error), Tls(pages.pvv.ntnu.noShow allYou said: impl From<sqlx::Error> for ApiError {
-    fn from(err: sqlx::Error) -> Self {
-        eprintln!("SQLx Error: {err:?}");
-        match err {
-            sqlx::Error::RowNotFound => ApiError::TaskNotFound(Uuid::nil()),
-            sqlx::Error::Database(db_err) => {
-                if let Some(pg_err) = db_err.as_database_error() {
-                    if pg_err.code().map_or(false, |c| c == "23505") {
-                        return ApiError::InvalidInput(format!(
-                            "Duplicate entry: {}",
-                            pg_err
-                                .detail()
-                                .unwrap_or("A record with that unique value already exists.")
-                        ));
-                    }
-                }
-                ApiError::DbError(err.to_string())
-            }
-            _ => ApiError::DbError(err.to_string()),
-        }
-    }
-}The issue is that inside sqlx::Error::Database(db_err), the db_err variable is already the unwrapped Box<dyn DatabaseError>. The as_database_error() method belongs to the outer sqlx::Error enum, which is why it cannot be found on db_err.Because db_err already implements the DatabaseError trait, you can access methods like .code() and .detail() directly on it without calling as_database_error().Additionally, since you destructured err in the match arm, you cannot use err.to_string() inside that arm. You should use db_err.to_string() instead.Fixed Implementationrustimpl From<sqlx::Error> for ApiError {
-    fn from(err: sqlx::Error) -> Self {
-        eprintln!("SQLx Error: {err:?}");
-        match err {
-            sqlx::Error::RowNotFound => ApiError::TaskNotFound(Uuid::nil()),
-            sqlx::Error::Database(db_err) => {
-                // db_err is already the database error box!
-                if db_err.code().map_or(false, |c| c == "23505") {
-                    return ApiError::InvalidInput(format!(
-                        "Duplicate entry: {}",
-                        db_err
-                            .detail()
-                            .unwrap_or("A record with that unique value already exists.")
-                    ));
-                }
-                ApiError::DbError(db_err.to_string())
-            }
-            _ => ApiError::DbError(err.to_string()),
-        }
-    }
-}
 impl From<sqlx::Error> for ApiError {
     fn from(err: sqlx::Error) -> Self {
         eprintln!("SQLx Error: {err:?}");
@@ -153,17 +104,17 @@ impl From<sqlx::Error> for ApiError {
             sqlx::Error::RowNotFound => ApiError::TaskNotFound(Uuid::nil()),
             sqlx::Error::Database(db_err) => {
                 // Downcast to Postgres-specific error to access .detail()
-                if let Some(pg_err) = db_err.downcast_ref::<sqlx::postgres::PgDatabaseError>() {
-                    if pg_err.code() == "23505" {
-                        return ApiError::InvalidInput(format!(
-                            "Duplicate entry: {}",
-                            pg_err
-                                .detail()
-                                .unwrap_or("A record with that unique value already exists.")
-                        ));
-                    }
+                if let Some(pg_err) = db_err.try_downcast_ref::<PgDatabaseError>()
+                    && pg_err.code() == "23505"
+                {
+                    return ApiError::InvalidInput(format!(
+                        "Duplicate entry: {}",
+                        pg_err
+                            .detail()
+                            .unwrap_or("A record with that unique value already exists.")
+                    ));
                 }
-                
+
                 ApiError::DbError(db_err.to_string())
             }
             _ => ApiError::DbError(err.to_string()),
@@ -175,7 +126,19 @@ async fn get_task_by_id(
     State(app_state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Task>, ApiError> {
-    Err(ApiError::TaskNotFound(id))
+    let task = sqlx::query_as!(
+        Task,
+        r#"
+        SELECT id, title, description, completed, created_at, updated_at
+        FROM tasks
+        WHERE id = $1
+        "#,
+        id
+    )
+    .fetch_optional(&app_state.db_pool)
+    .await?
+    .ok_or(ApiError::TaskNotFound(id))?;
+    Ok(Json(task))
 }
 
 async fn create_task_handler(
@@ -183,12 +146,18 @@ async fn create_task_handler(
     Json(payload): Json<CreateTaskPayload>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     let id = Uuid::new_v4();
-    let new_task = Task {
-        id,
-        title: payload.title,
-        description: payload.description,
-        completed: false,
-    };
+    let new_task = sqlx::query_as!(
+        Task,
+        r#"
+        INSERT INTO tasks (title, description)
+        VALUES ($1, $2)
+        RETURNING *
+        "#,
+        payload.title,
+        payload.description
+    )
+    .fetch_one(&app_state.db_pool)
+    .await?;
 
     Ok((StatusCode::CREATED, Json(new_task)))
 }
@@ -196,7 +165,18 @@ async fn create_task_handler(
 async fn get_all_tasks(
     State(app_state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<Task>>, ApiError> {
-    Ok(Json(vec![]))
+    let tasks = sqlx::query_as!(
+        Task,
+        r#"
+        SELECT id, title, description, completed, created_at, updated_at
+        FROM tasks
+        ORDER BY created_at DESC
+        "#,
+    )
+    .fetch_all(&app_state.db_pool)
+    .await?;
+
+    Ok(Json(tasks))
 }
 
 async fn update_task(
@@ -204,14 +184,50 @@ async fn update_task(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateTaskPayload>,
 ) -> Result<Json<Task>, ApiError> {
-    Err(ApiError::TaskNotFound(id))
+    let updated_task = sqlx::query_as!(
+        Task,
+        r#"
+        UPDATE tasks
+        SET
+            title = COALESCE($1, title),
+            description = COALESCE($2, description),
+            completed = COALESCE($3, completed),
+            updated_at = NOW()
+        WHERE id = $4
+        RETURNING *
+        "#,
+        payload.title,
+        payload.description,
+        payload.completed,
+        id
+    )
+    .fetch_optional(&app_state.db_pool)
+    .await?
+    .ok_or(ApiError::TaskNotFound(id))?;
+
+    Ok(Json(updated_task))
 }
 
 async fn delete_task(
     State(app_state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    Err(ApiError::TaskNotFound(id))
+    let affected_rows = sqlx::query!(
+        r#"
+        DELETE FROM tasks
+        WHERE id = $1
+        "#,
+        id
+    )
+    .execute(&app_state.db_pool)
+    .await?
+    .rows_affected();
+
+    if affected_rows == 0 {
+        Err(ApiError::TaskNotFound(id))
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
 }
 
 async fn create_app() -> Router {

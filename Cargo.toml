@@ -17,6 +17,7 @@ sqlx = { version = "0.7", features = [
     "json",
 ] }
 dotenvy = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 http-body-util = "0.1.3"
