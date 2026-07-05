@@ -1,5 +1,9 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{fmt::format, net::SocketAddr, sync::Arc};
 
+use argon2::{
+    Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
+    password_hash::{SaltString, rand_core::OsRng},
+};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -7,6 +11,7 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, post, put},
 };
+use base64::{Engine, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 use sqlx::{
     PgPool,
@@ -161,9 +166,141 @@ impl From<sqlx::Error> for ApiError {
                     ApiError::DbError(db_err.to_string())
                 }
             }
+            sqlx::Error::PoolTimedOut => ApiError::InternalServerError(
+                "Database connection pool exhausted. Please try again later.".to_string(),
+            ),
+            sqlx::Error::Io(io_err) => {
+                ApiError::InternalServerError(format!("Database I/O error: {io_err}"))
+            }
+            sqlx::Error::Decode(decode_err) => ApiError::InternalServerError(format!(
+                "Database data decoding error. Check schema and types: {decode_err}"
+            )),
             _ => ApiError::DbError(err.to_string()),
         }
     }
+}
+
+async fn register_user(
+    State(app_state): State<Arc<AppState>>,
+    Json(payload): Json<RegisterUserPayload>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    if payload.email.is_empty() || payload.password.is_empty() {
+        return Err(ApiError::InvalidInput(
+            "Email and password is required.".to_string(),
+        ));
+    }
+    if !payload.email.contains('@') {
+        return Err(ApiError::InvalidInput("Invalid email format.".to_string()));
+    }
+    if payload.password.len() < 8 {
+        return Err(ApiError::InvalidInput(
+            "Password must be at least 8 characters long.".to_string(),
+        ));
+    }
+
+    // Generate a random salt for password hashing.
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+
+    // Hash the passord
+    let password_hash = argon2
+        .hash_password(payload.password.as_bytes(), &salt)
+        .map_err(|e| ApiError::InternalServerError(format!("Failed to has password: {e}")))?
+        .to_string();
+
+    // Store salt as base64 string
+    let salt_b64 = general_purpose::STANDARD.encode(salt.as_str());
+
+    // Insert new user into the database
+    let created_user = sqlx::query_as!(
+        User,
+        r#"
+        INSERT INTO users (email, password_hash, password_salt)
+        VALUES ($1, $2, $3)
+        RETURNING id, email, password_hash, password_salt, created_at, updated_at
+        "#,
+        payload.email,
+        password_hash,
+        salt_b64
+    )
+    .fetch_one(&app_state.db_pool)
+    .await;
+
+    match created_user {
+        Ok(user) => Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!(
+                {
+                    "message": "User registered successfully.",
+                    "user_id": user.id,
+                    "email": user.email
+                }
+            )),
+        )),
+        Err(sqlx::Error::Database(db_err)) => {
+            if let Some(pg_err) = db_err.try_downcast_ref::<PgDatabaseError>() {
+                if pg_err.code() == "23505" {
+                    return Err(ApiError::UserAlreadyExists(payload.email));
+                }
+            }
+            Err(sqlx::Error::Database(db_err.into()).into())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn login_user(
+    State(app_state): State<Arc<AppState>>,
+    Json(payload): Json<LoginUserPayload>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // Validation
+    if payload.email.is_empty() || payload.password.is_empty() {
+        return Err(ApiError::InvalidInput(
+            "Email and password are required".to_string(),
+        ));
+    }
+
+    let user = sqlx::query_as!(
+        User,
+        r#"
+        SELECT id, email, password_hash, password_salt, created_at, updated_at
+        FROM users
+        WHERE email = $1
+        "#,
+        payload.email
+    )
+    .fetch_optional(&app_state.db_pool)
+    .await?;
+
+    let user = match user {
+        Some(u) => u,
+        None => return Err(ApiError::InvalidCredentials),
+    };
+
+    // Decode stored salt
+    let salt = SaltString::from_b64(&user.password_salt);
+
+    // Verify password
+    let argon2 = Argon2::default();
+    let parsed_hash = PasswordHash::new(&user.password_hash).expect("Failed to parse hash string");
+    let is_valid = argon2
+        .verify_password(payload.password.as_bytes(), &parsed_hash)
+        .is_ok();
+    if !is_valid {
+        return Err(ApiError::InvalidCredentials);
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!(
+            {
+                "message": "Login successful",
+                "user_id": user.id,
+                "email": user.email
+                // Add token/session info here in future sections
+            }
+        )),
+    ))
 }
 
 async fn get_task_by_id(
@@ -299,6 +436,8 @@ async fn create_app() -> Router {
         .route("/tasks", get(get_all_tasks))
         .route("/tasks/{id}", put(update_task))
         .route("/tasks/{id}", delete(delete_task))
+        .route("/register", post(register_user))
+        .route("/login", post(login_user))
         .with_state(app_state)
 }
 
